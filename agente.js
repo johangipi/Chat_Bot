@@ -24,6 +24,32 @@ async function generarContenidoConReintentos(solicitud) {
 const agenda = { "2026-11-10": ["09:00", "11:30", "15:00"] };
 const citas = new Map();
 
+function fechaValida(fecha) {
+  if (typeof fecha !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
+    return false;
+  }
+
+  const [anio, mes, dia] = fecha.split("-").map(Number);
+  const fechaObjeto = new Date(Date.UTC(anio, mes - 1, dia));
+
+  return (
+    fechaObjeto.getUTCFullYear() === anio &&
+    fechaObjeto.getUTCMonth() === mes - 1 &&
+    fechaObjeto.getUTCDate() === dia
+  );
+}
+
+function fechaFutura(fecha) {
+  const partesHoy = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Bogota",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const hoy = Object.fromEntries(partesHoy.map(({ type, value }) => [type, value]));
+  return fecha > `${hoy.year}-${hoy.month}-${hoy.day}`;
+}
+
 const herramientas = {
   consultar_disponibilidad: {
     def: {
@@ -36,9 +62,17 @@ const herramientas = {
         required: ["fecha"],
       },
     },
-    run: ({ fecha }) =>
-      (agenda[fecha] ?? []).filter((hora) => !citas.has(`${fecha} ${hora}`)),
+    run: ({ fecha }) => {
+      if (!fechaValida(fecha) || !fechaFutura(fecha)) {
+        return { error: "Selecciona una fecha futura válida." };
+      }
+
+      return (agenda[fecha] ?? []).filter(
+        (hora) => !citas.has(`${fecha} ${hora}`)
+      );
+    },
   },
+
   agendar_cita: {
     def: {
       name: "agendar_cita",
@@ -56,6 +90,10 @@ const herramientas = {
       },
     },
     run: ({ fecha, hora, nombre, motivo }) => {
+      if (!fechaValida(fecha) || !fechaFutura(fecha)) {
+        return { error: "Selecciona una fecha futura válida." };
+      }
+
       const clave = `${fecha} ${hora}`;
       const disponibles = agenda[fecha] ?? [];
       if (!nombre?.trim() || !motivo?.trim() || !disponibles.includes(hora) || citas.has(clave)) {
@@ -66,6 +104,7 @@ const herramientas = {
       return { confirmada: true, fecha, hora };
     },
   },
+
   consultar_cita: {
     def: {
       name: "consultar_cita",
