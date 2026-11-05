@@ -6,8 +6,20 @@ if (!process.env.GEMINI_API_KEY) {
 }
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 const conversaciones = new Map(); // userId -> contents[]
+
+async function generarContenidoConReintentos(solicitud) {
+  for (let intento = 0; ; intento++) {
+    try {
+      return await ai.models.generateContent(solicitud);
+    } catch (error) {
+      const reintentable = [429, 500, 502, 503, 504].includes(error?.status);
+      if (!reintentable || intento >= 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** intento));
+    }
+  }
+}
 
 const agenda = { "2026-11-10": ["09:00", "11:30", "15:00"] };
 const citas = new Map();
@@ -168,7 +180,7 @@ export async function responder(userId, texto) {
   conversaciones.set(userId, contents);
 
   for (let i = 0; i < 5; i++) {
-    const res = await ai.models.generateContent({
+    const res = await generarContenidoConReintentos({
       model: MODEL,
       contents,
       config: {
