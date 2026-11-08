@@ -7,7 +7,72 @@ if (!process.env.GEMINI_API_KEY) {
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
-const conversaciones = new Map(); // userId -> contents[]
+const conversaciones = new Map(); // userId -> historial enviado al modelo
+const estadosConversacion = new Map(); // userId -> { estado, motivo, fecha }
+
+// Consultar el estado de una conversación
+export function obtenerEstadoConversacion(userId) {
+  return estadosConversacion.get(userId) ?? {
+    estado: "bot_active",
+    motivo: null,
+    fecha: null
+  };
+}
+
+// Cambiar el estado de una conversación
+export function cambiarEstadoConversacion(userId, nuevoEstado, motivo = null) {
+  if (typeof userId !== "string" || !userId.trim() || userId.length > 128) {
+    return { error: true, mensaje: "Identificador de usuario inválido." };
+  }
+
+  const id = userId.trim();
+  const estadoActual = obtenerEstadoConversacion(id).estado;
+  const transicionesPermitidas = {
+    bot_active: ["human_requested"],
+    human_requested: ["human_active"],
+    human_active: ["resolved"],
+    resolved: ["bot_active"],
+  };
+
+  if (!transicionesPermitidas[estadoActual]?.includes(nuevoEstado)) {
+    return {
+      error: true,
+      mensaje: `No se permite cambiar de ${estadoActual} a ${nuevoEstado}.`
+    };
+  }
+
+  const registro = {
+    estado: nuevoEstado,
+    motivo:
+      typeof motivo === "string" && motivo.trim()
+        ? motivo.trim()
+        : obtenerEstadoConversacion(id).motivo,
+    fecha: new Date().toISOString(),
+  };
+
+  estadosConversacion.set(id, registro);
+
+  return {
+    error: false,
+    ...registro
+  };
+}
+
+function detectarSolicitudHumana(texto) {
+  const mensaje = texto
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+
+  const patrones = [
+    /\b(hablar con (una )?persona|hablar con alguien)\b/,
+    /\b(asesor(a)?|agente humano|persona real|atencion humana)\b/,
+    /\b(quiero que me atienda alguien|necesito atencion personalizada)\b/,
+    /\b(poner una queja|presentar una queja|hacer un reclamo)\b/
+  ];
+
+  return patrones.some((patron) => patron.test(mensaje));
+}
 
 async function generarContenidoConReintentos(solicitud) {
   for (let intento = 0; ; intento++) {
@@ -23,6 +88,28 @@ async function generarContenidoConReintentos(solicitud) {
 
 const agenda = { "2026-11-10": ["09:00", "11:30", "15:00"] };
 const citas = new Map();
+
+export function solicitarAtencionHumana(userId, motivo) {
+  if (typeof userId !== "string" || !userId.trim() || userId.length > 128) {
+    throw new TypeError("userId debe ser una cadena no vacía de hasta 128 caracteres.");
+  }
+  if (typeof motivo !== "string" || !motivo.trim() || motivo.length > 500) {
+    throw new TypeError("motivo debe ser una cadena no vacía de hasta 500 caracteres.");
+  }
+
+  const solicitud = cambiarEstadoConversacion(
+    userId,
+    "human_requested",
+    motivo,
+  );
+  if (solicitud.error) throw new Error(solicitud.mensaje);
+
+  return {
+    ...solicitud,
+    telefono: CLINICA.telefonoHumano,
+    notificacionEnviada: false,
+  };
+}
 
 function fechaValida(fecha) {
   if (typeof fecha !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
@@ -153,6 +240,21 @@ const herramientas = {
       return { cancelada: true, fecha, hora };
     },
   },
+  solicitar_atencion_humana: {
+    def: {
+      name: "solicitar_atencion_humana",
+      description:
+        "Registra que la persona solicita atención humana. Úsala cuando lo pida o cuando no puedas ayudarle. No afirmes que se notificó a una persona.",
+      parametersJsonSchema: {
+        type: "object",
+        properties: {
+          motivo: { type: "string", description: "Motivo breve de la solicitud" },
+        },
+        required: ["motivo"],
+      },
+    },
+    run: ({ motivo }, userId) => solicitarAtencionHumana(userId, motivo),
+  },
 };
 
 function sistema() {
@@ -178,7 +280,8 @@ Eres el asistente virtual por WhatsApp de ${CLINICA.nombre}. Atiendes a paciente
 2. Consultar horarios libres con consultar_disponibilidad. Nunca inventes horarios.
 3. Agendar citas con agendar_cita solo después de que el paciente confirme.
 4. Verificar y cancelar citas con consultar_cita y cancelar_cita, respectivamente, después de obtener confirmación explícita para cancelar.
-5. Pasar con una persona del equipo cuando corresponda.
+5. Si la persona pide atención humana o no puedes resolver su consulta, usa solicitar_atencion_humana.
+6. La solicitud solo queda marcada en el sistema; no se envía una notificación al equipo. Indica el teléfono de contacto y nunca afirmes que una persona ya fue avisada.
 
 # FLUJO PARA AGENDAR
 1. Pregunta el motivo general de la cita y para qué fecha.
@@ -211,11 +314,20 @@ Eres el asistente virtual por WhatsApp de ${CLINICA.nombre}. Atiendes a paciente
 }
 
 const FALLO = `Tuve un inconveniente técnico. Por favor llama al ${CLINICA.telefonoHumano}.`;
+const MENSAJE_ATENCION_PENDIENTE =
+  `Su conversación está en espera de atención humana. Para comunicarse con el equipo, llame al ${CLINICA.telefonoHumano}.`;
 
 export async function responder(userId, texto) {
+  if (obtenerEstadoConversacion(userId).estado !== "bot_active") {
+    return MENSAJE_ATENCION_PENDIENTE;
+  }
+
   const contents = conversaciones.get(userId) ?? [];
   if (contents.length > 40) contents.length = 0;
-  contents.push({ role: "user", parts: [{ text: texto }] });
+  contents.push({
+    role: "user",
+    parts: [{ text: texto }],
+  });
   conversaciones.set(userId, contents);
 
   for (let i = 0; i < 5; i++) {
@@ -239,7 +351,12 @@ export async function responder(userId, texto) {
       const h = herramientas[c.name];
       try {
         if (!h) throw new Error("Herramienta desconocida");
-        return { functionResponse: { name: c.name, response: { result: h.run(c.args) } } };
+        return {
+          functionResponse: {
+            name: c.name,
+            response: { result: h.run(c.args, userId) },
+          },
+        };
       } catch (e) {
         return { functionResponse: { name: c.name, response: { error: e.message } } };
       }
